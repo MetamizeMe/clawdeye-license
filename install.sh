@@ -21,6 +21,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 INSTALL_DIR="$HOME/clawdeye"
+REPO="MetamizeMe/clawdeye-releases"
 
 banner() {
   echo ""
@@ -59,30 +60,25 @@ ask_secret() {
 
 banner
 
-# Check Docker
-if ! command -v docker &>/dev/null; then
-  error "Docker is not installed."
-  echo "  Install Docker: https://docs.docker.com/get-docker/"
+# Check Node.js
+if ! command -v node &>/dev/null; then
+  error "Node.js is not installed."
+  echo "  Install Node.js 20+: https://nodejs.org/"
   exit 1
 fi
 
-if ! docker info &>/dev/null 2>&1; then
-  error "Docker is not running. Please start Docker and try again."
+NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
+if [ "$NODE_VERSION" -lt 20 ]; then
+  error "Node.js 20+ required (found: $(node -v))"
   exit 1
 fi
+success "Node.js $(node -v) found"
 
-# Check docker compose
-if docker compose version &>/dev/null 2>&1; then
-  COMPOSE="docker compose"
-elif command -v docker-compose &>/dev/null; then
-  COMPOSE="docker-compose"
-else
-  error "Docker Compose is not installed."
-  echo "  Install Docker Compose: https://docs.docker.com/compose/install/"
+# Check curl
+if ! command -v curl &>/dev/null; then
+  error "curl is not installed."
   exit 1
 fi
-
-success "Docker is running"
 
 # ── Gather configuration ──────────────────────────────
 
@@ -109,26 +105,8 @@ echo -e "${DIM}─────────────────────�
 CLAWD_HOME=$(ask "Clawd workspace path" "$HOME/clawd")
 CLAWDBOT_HOME=$(ask "Clawdbot home path" "$HOME/.clawdbot")
 OPENCLAW_HOME=$(ask "OpenClaw home path" "$HOME/.openclaw")
-
-echo ""
-echo -e "${BOLD}Network${NC} ${DIM}(press Enter to accept defaults)${NC}"
-echo -e "${DIM}─────────────────────────────────────────${NC}"
-
-GATEWAY_HOST=$(ask "Gateway host" "host.docker.internal")
 GATEWAY_PORT=$(ask "Gateway port" "18789")
 DASHBOARD_PORT=$(ask "Dashboard port" "3000")
-
-# ── Verify paths ──────────────────────────────────────
-
-echo ""
-for p in "$CLAWD_HOME" "$CLAWDBOT_HOME" "$OPENCLAW_HOME"; do
-  expanded=$(eval echo "$p")
-  if [ -d "$expanded" ]; then
-    success "Found $expanded"
-  else
-    warn "Directory not found: $expanded (will be created if needed)"
-  fi
-done
 
 # ── Confirm ───────────────────────────────────────────
 
@@ -138,7 +116,7 @@ echo -e "${DIM}─────────────────────�
 echo -e "  Install to:      ${BOLD}${INSTALL_DIR}${NC}"
 echo -e "  Dashboard:       ${BOLD}http://localhost:${DASHBOARD_PORT}${NC}"
 echo -e "  Clawd workspace: ${CLAWD_HOME}"
-echo -e "  Gateway:         ${GATEWAY_HOST}:${GATEWAY_PORT}"
+echo -e "  Gateway port:    ${GATEWAY_PORT}"
 echo ""
 
 CONFIRM=$(ask "Proceed with installation? (y/n)" "y")
@@ -147,86 +125,131 @@ if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
   exit 0
 fi
 
-# ── Create files ──────────────────────────────────────
+# ── Download latest release ───────────────────────────
 
 echo ""
-info "Creating ${INSTALL_DIR}..."
+info "Fetching latest release..."
+
+# Get latest release tag from GitHub API
+LATEST_TAG=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+
+if [ -z "$LATEST_TAG" ]; then
+  error "Could not determine latest version. Check https://github.com/${REPO}/releases"
+  exit 1
+fi
+
+success "Latest version: ${LATEST_TAG}"
+
+ASSET_NAME="clawdeye-${LATEST_TAG}.tgz"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET_NAME}"
+
+info "Downloading ${ASSET_NAME}..."
 mkdir -p "$INSTALL_DIR"
 
-# .env
+if ! curl -sL "$DOWNLOAD_URL" -o "/tmp/${ASSET_NAME}"; then
+  error "Download failed: ${DOWNLOAD_URL}"
+  exit 1
+fi
+success "Downloaded ${ASSET_NAME}"
+
+# ── Extract ───────────────────────────────────────────
+
+info "Extracting to ${INSTALL_DIR}..."
+tar -xzf "/tmp/${ASSET_NAME}" -C "$INSTALL_DIR"
+rm -f "/tmp/${ASSET_NAME}"
+success "Extracted to ${INSTALL_DIR}"
+
+# ── Create .env ───────────────────────────────────────
+
+info "Creating .env..."
 cat > "$INSTALL_DIR/.env" << EOF
+DATABASE_URL=file:${INSTALL_DIR}/data/openclaw.db
+CLAWDEYE_ROOT=${INSTALL_DIR}
+CLAWDEYE_DATA_DIR=${INSTALL_DIR}/data
 CLAWDEYE_LICENSE=${LICENSE}
 DASHBOARD_TOKEN=${PASSWORD}
 CLAWD_HOME=${CLAWD_HOME}
 CLAWDBOT_HOME=${CLAWDBOT_HOME}
 OPENCLAW_HOME=${OPENCLAW_HOME}
-GATEWAY_HOST=${GATEWAY_HOST}
+GATEWAY_HOST=127.0.0.1
 GATEWAY_PORT=${GATEWAY_PORT}
-DASHBOARD_PORT=${DASHBOARD_PORT}
+API_PORT=4010
 EOF
 success "Created .env"
 
-# docker-compose.yml
-cat > "$INSTALL_DIR/docker-compose.yml" << 'EOF'
-# ClawdEye Monitor — Docker Compose
-# Managed by install script. Edit .env to change settings.
+# ── Initialize database ──────────────────────────────
 
-services:
-  clawdeye:
-    image: metamize/clawdeye:latest
-    container_name: clawdeye
-    ports:
-      - "${DASHBOARD_PORT:-3000}:3000"
-    volumes:
-      - clawdeye-data:/app/data
-      - ${CLAWD_HOME:-~/clawd}:/clawd:ro
-      - ${CLAWDBOT_HOME:-~/.clawdbot}:/clawdbot:ro
-      - ${OPENCLAW_HOME:-~/.openclaw}:/openclaw:ro
-    environment:
-      - DATABASE_URL=file:/app/data/openclaw.db
-      - CLAWDEYE_ROOT=/app
-      - CLAWDEYE_DATA_DIR=/app/data
-      - API_HOST=0.0.0.0
-      - API_PORT=4010
-      - API_INTERNAL_URL=http://127.0.0.1:4010
-      - CLAWD_HOME=/clawd
-      - CLAWDBOT_HOME=/clawdbot
-      - OPENCLAW_HOME=/openclaw
-      - GATEWAY_HOST=${GATEWAY_HOST:-host.docker.internal}
-      - GATEWAY_PORT=${GATEWAY_PORT:-18789}
-      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:-changeme}
-      - CLAWDEYE_LICENSE=${CLAWDEYE_LICENSE}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+info "Initializing database..."
+mkdir -p "$INSTALL_DIR/data"
 
-volumes:
-  clawdeye-data:
-EOF
-success "Created docker-compose.yml"
-
-# ── Pull & Start ──────────────────────────────────────
-
-info "Pulling ClawdEye image..."
 cd "$INSTALL_DIR"
-$COMPOSE pull
+npx prisma db push --schema=prisma/schema.prisma 2>/dev/null
+success "Database initialized"
 
+# ── Create start script ──────────────────────────────
+
+cat > "$INSTALL_DIR/start.sh" << 'STARTEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load .env
+set -a
+source "$DIR/.env"
+set +a
+
+echo "Starting ClawdEye Monitor..."
+
+# Start API
+node "$DIR/api/server.mjs" &
+API_PID=$!
+
+# Start Collector
+node "$DIR/collector/index.mjs" &
+COLLECTOR_PID=$!
+
+echo "  API server:  PID $API_PID (port ${API_PORT:-4010})"
+echo "  Collector:   PID $COLLECTOR_PID"
 echo ""
-info "Starting ClawdEye..."
-$COMPOSE up -d
+echo "  Dashboard:   http://localhost:${DASHBOARD_PORT:-3000}"
+echo ""
+echo "  Press Ctrl+C to stop"
+
+cleanup() {
+  echo ""
+  echo "Shutting down..."
+  kill $API_PID $COLLECTOR_PID 2>/dev/null || true
+  wait $API_PID $COLLECTOR_PID 2>/dev/null || true
+  echo "Stopped."
+}
+trap cleanup SIGINT SIGTERM
+
+wait
+STARTEOF
+chmod +x "$INSTALL_DIR/start.sh"
+success "Created start.sh"
+
+# ── Create stop script ───────────────────────────────
+
+cat > "$INSTALL_DIR/stop.sh" << 'STOPEOF'
+#!/usr/bin/env bash
+pkill -f "clawdeye.*server.mjs" 2>/dev/null && echo "API stopped" || echo "API not running"
+pkill -f "clawdeye.*index.mjs" 2>/dev/null && echo "Collector stopped" || echo "Collector not running"
+STOPEOF
+chmod +x "$INSTALL_DIR/stop.sh"
+success "Created stop.sh"
 
 # ── Done ──────────────────────────────────────────────
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║${NC}  ${BOLD}ClawdEye is running!${NC}                     ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}  ${BOLD}ClawdEye is installed!${NC}                   ${GREEN}║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Dashboard:${NC}  http://localhost:${DASHBOARD_PORT}"
-echo -e "  ${BOLD}Password:${NC}   (the one you just entered)"
-echo -e "  ${BOLD}Files:${NC}      ${INSTALL_DIR}"
+echo -e "  ${BOLD}Start:${NC}     ${INSTALL_DIR}/start.sh"
+echo -e "  ${BOLD}Stop:${NC}      ${INSTALL_DIR}/stop.sh"
+echo -e "  ${BOLD}Dashboard:${NC} http://localhost:${DASHBOARD_PORT}"
+echo -e "  ${BOLD}Files:${NC}     ${INSTALL_DIR}"
 echo ""
-echo -e "  ${DIM}Update:  cd ${INSTALL_DIR} && ${COMPOSE} pull && ${COMPOSE} up -d${NC}"
-echo -e "  ${DIM}Stop:    cd ${INSTALL_DIR} && ${COMPOSE} down${NC}"
-echo -e "  ${DIM}Logs:    cd ${INSTALL_DIR} && ${COMPOSE} logs -f${NC}"
+echo -e "  ${DIM}To update: re-run this installer${NC}"
 echo ""
